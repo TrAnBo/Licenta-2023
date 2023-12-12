@@ -1,0 +1,183 @@
+from jira import JIRA
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill
+from openpyxl.worksheet.hyperlink import Hyperlink
+import config  # Import your configuration
+
+
+def get_issues(jira, jql_query):
+    return jira.search_issues(jql_query, maxResults=False)
+
+
+def organize_issues_by_component(issues):
+    # Initialize an empty component_issues dictionary
+    component_issues = {}
+
+    for issue in issues:
+        components_list = [component.name for component in issue.fields.components] if issue.fields.components else ["Other"]
+        issue_type = issue.fields.issuetype.name
+
+        for component in components_list:
+            if component not in component_issues:
+                component_issues[component] = {'Story': [], 'Subtask': []}  # Create a new entry for the component
+
+            if issue_type == 'Story':
+                component_issues[component]['Story'].append(issue)
+            elif issue_type == 'Sub-task':
+                component_issues[component]['Subtask'].append(issue)
+
+    # Remove 'Other' components with no associated tickets
+    component_issues = {component: issue_dict for component, issue_dict in component_issues.items() if any(issue_dict.values())}
+
+    # Sort the components so that 'Other' is at the end
+    sorted_component_issues = dict(sorted(component_issues.items(), key=lambda item: item[0] != 'Other'))
+
+    return sorted_component_issues
+
+
+
+def set_cell_style(cell, fill=None, font=None, hyperlink=None):
+    if fill:
+        cell.fill = fill
+    if font:
+        cell.font = font
+    if hyperlink:
+        cell.hyperlink = hyperlink
+
+
+def safe_nested_getattr(obj, attr_string, default="Empty Data"):
+    attributes = attr_string.split('.')
+    for attr in attributes:
+        obj = getattr(obj, attr, None)
+        if obj is None:
+            return default
+    return obj
+
+
+def write_issue_to_row(ws, row_num, issue, jira_url_base, fill, font=None):
+    fields = [
+        ("key", 2, None),  # Assuming 'key' is a special field that needs to be handled differently
+        ("fields.summary", 3, None),
+        ("fields.description", 4, None),
+        ("fields.status.name", 5, None),
+        ("fields.issuetype.name", 6, None),
+        ("fields.assignee.displayName", 7, None),  # Assignee
+        ("fields.customfield_10005", 8, None),  # Sprint (Custom Field)
+        ("fields.customfield_13729", 9, None),  # Review Object Path (Custom Field)
+    ]
+
+    for field, col, special_value in fields:
+        value = special_value if special_value is not None else safe_nested_getattr(issue, field)
+        # Process the Sprint field
+        if field == "fields.customfield_10005":
+            if isinstance(value, list):
+                # Extract the name from the complex object
+                sprint_data = value[0]  # Assuming it's the first element of the list
+                sprint_name = sprint_data.split(",name=")[1].split(",")[0]  # Extract the name
+                value = sprint_name
+            else:
+                value = "Empty Data"  # If it's not a list, set it to an empty string
+
+        cell = ws.cell(row=row_num, column=col, value=value)
+
+        # Set the background color to FFFFCC for cells with "Empty Data" or None
+        if value in ["Empty Data", None]:
+            cell.fill = PatternFill(start_color="FFFFCC", end_color="FFFFCC", fill_type="solid")
+
+        set_cell_style(cell, fill, font, hyperlink=f"{jira_url_base}/browse/{issue.key}" if field == "key" else None)
+
+
+def write_to_worksheet(ws, component_issues, jira_url_base):
+    # Define cell styles
+    story_fill = PatternFill(start_color="97DFC6", end_color="97DFC6", fill_type="solid")
+    subtask_fill = PatternFill(start_color="C0C0C0", end_color="C0C0C0", fill_type="solid")
+    bold_font = Font(bold=True)
+
+    # Initialize headers
+    for col_num, header in enumerate(["Component", "Key", "Summary", "Description", "Status", "IssueType", "Assignee", "Sprint", "Review Object Path"], 1):
+        cell = ws.cell(row=1, column=col_num, value=header)
+        set_cell_style(cell, font=bold_font)
+
+    row_num = 2
+
+    for component, issue_dict in component_issues.items():
+        cell = ws.cell(row=row_num, column=1, value=component)
+        set_cell_style(cell, font=bold_font)
+        row_num += 1
+
+        for issue_type in ['Story']:
+            for issue in issue_dict.get(issue_type, []):
+                write_issue_to_row(ws, row_num, issue, jira_url_base, story_fill, bold_font)
+                row_num += 1
+
+                for subtask in issue_dict.get('Subtask', []):
+                    if hasattr(subtask.fields, 'parent') and subtask.fields.parent.key == issue.key:
+                        write_issue_to_row(ws, row_num, subtask, jira_url_base, subtask_fill)
+                        row_num += 1
+
+
+def get_subtasks_for_stories(jira, story_issues):
+    story_to_subtasks = {}
+    for story in story_issues:
+        subtasks_jql_query = f'issuetype in ("Implementation Subtask", "Analysis Subtask", "Review Subtask", "Documentation Subtask") AND parent = {story.key}'
+        subtasks = get_issues(jira, subtasks_jql_query)
+        story_to_subtasks[story.key] = subtasks
+    return story_to_subtasks
+
+
+def main():
+    # Use the credentials from the configuration
+    user = config.JIRA_USER
+    apikey = config.JIRA_API_KEY
+    server = config.JIRA_SERVER
+
+    options = {
+        'server': server
+    }
+
+    jira = JIRA(options, basic_auth=(user, apikey))
+    # Initialize Jira client (Assuming jira object is already created)
+
+    jql_query = (
+        'project = "DVC G_AS_PF_TRX_GEN2" AND "Responsible Team" = "THE RANGERS" AND fixVersion = PI-23Q3 ORDER BY priority DESC'
+    )
+
+    issues = get_issues(jira, jql_query)
+    component_issues = organize_issues_by_component(issues)
+
+    story_to_subtasks = get_subtasks_for_stories(jira, [issue for issue in issues if issue.fields.issuetype.name == 'Story'])
+
+    # Add subtasks to component_issues
+    for component in component_issues:
+        component_issues[component]['Subtask'] = []
+
+    # Loop through each story to find its subtasks and append them to the appropriate component
+    for story_key, subtasks in story_to_subtasks.items():
+        story_issue = next(issue for issue in issues if issue.key == story_key)
+        components_list = [component.name for component in story_issue.fields.components] if story_issue.fields.components else ["Other"]
+
+        for component in components_list:
+            if component not in component_issues:
+                component = 'Other'
+
+            component_issues[component]['Subtask'].extend(subtasks)
+
+    wb = Workbook()
+    ws = wb.active
+
+    # Set the width of column B to a predefined value (e.g., 15 characters)
+    column_letter = 'B'  # Replace with the column you want to adjust
+    column_dimension = ws.column_dimensions[column_letter]
+    column_dimension.width = 15
+
+    write_to_worksheet(ws, component_issues, server)
+
+    excel_file_path = "exported_issues.xlsx"
+    wb.save(excel_file_path)
+
+    print(f"Exported issues to '{excel_file_path}'")
+
+
+if __name__ == '__main__':
+    main()
